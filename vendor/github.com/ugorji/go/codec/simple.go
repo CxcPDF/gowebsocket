@@ -224,12 +224,12 @@ func (d *simpleDecDriver) readNextBd() {
 	d.bdRead = true
 }
 
-// func (d *simpleDecDriver) uncacheRead() {
-// 	if d.bdRead {
-// 		d.d.decRd.unreadn1()
-// 		d.bdRead = false
-// 	}
-// }
+func (d *simpleDecDriver) uncacheRead() {
+	if d.bdRead {
+		d.d.decRd.unreadn1()
+		d.bdRead = false
+	}
+}
 
 func (d *simpleDecDriver) advanceNil() (null bool) {
 	d.fnil = false
@@ -244,9 +244,9 @@ func (d *simpleDecDriver) advanceNil() (null bool) {
 	return
 }
 
-// func (d *simpleDecDriver) Nil() bool {
-// 	return d.fnil
-// }
+func (d *simpleDecDriver) Nil() bool {
+	return d.fnil
+}
 
 func (d *simpleDecDriver) ContainerType() (vt valueType) {
 	if !d.bdRead {
@@ -560,7 +560,7 @@ func (d *simpleDecDriver) DecodeNaked() {
 		n.s = string(d.DecodeStringAsBytes())
 	case simpleVdByteArray, simpleVdByteArray + 1,
 		simpleVdByteArray + 2, simpleVdByteArray + 3, simpleVdByteArray + 4:
-		fauxUnionReadRawBytes(d, &d.d, n, d.h.RawToString)
+		decNakedReadRawBytes(d, &d.d, n, d.h.RawToString)
 	case simpleVdExt, simpleVdExt + 1, simpleVdExt + 2, simpleVdExt + 3, simpleVdExt + 4:
 		n.v = valueTypeExt
 		l := d.decLen()

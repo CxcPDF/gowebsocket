@@ -63,7 +63,7 @@ var (
 	errDecUnreadByteUnknown         = errors.New("cannot unread - reason unknown")
 	errMaxDepthExceeded             = errors.New("maximum decoding depth exceeded")
 
-	// errBytesDecReaderCannotUnread = errors.New("cannot unread last byte read")
+	errBytesDecReaderCannotUnread = errors.New("cannot unread last byte read")
 )
 
 type decDriver interface {
@@ -82,7 +82,7 @@ type decDriver interface {
 
 	// DecodeNaked will decode primitives (number, bool, string, []byte) and RawExt.
 	// For maps and arrays, it will not do the decoding in-band, but will signal
-	// the decoder, so that is done later, by setting the fauxUnion.valueType field.
+	// the decoder, so that is done later, by setting the decNaked.valueType field.
 	//
 	// Note: Numbers are decoded as int64, uint64, float64 only (no smaller sized number types).
 	// for extensions, DecodeNaked must read the tag and the []byte if it exists.
@@ -132,7 +132,7 @@ type decDriver interface {
 
 	reset()
 	atEndOfDecode()
-	// uncacheRead()
+	uncacheRead()
 
 	decoder() *Decoder
 }
@@ -501,7 +501,7 @@ func (d *Decoder) kInterfaceNaked(f *codecFnInfo) (rvn reflect.Value) {
 	case valueTypeTime:
 		rvn = n.rt()
 	default:
-		halt.errorf("kInterfaceNaked: unexpected valueType: %d", n.v)
+		panicv.errorf("kInterfaceNaked: unexpected valueType: %d", n.v)
 	}
 	return
 }
@@ -659,10 +659,6 @@ func (d *Decoder) kStruct(f *codecFnInfo, rv reflect.Value) {
 }
 
 func (d *Decoder) kSlice(f *codecFnInfo, rv reflect.Value) {
-	// if f.seq == seqTypeArray {
-	// 	xdebugf("decoder.kSlice: %v, %#v", rv.Type(), rv)
-	// }
-
 	// A slice can be set from a map or array in stream.
 	// This way, the order can be kept (as order is lost with map).
 
@@ -775,13 +771,21 @@ func (d *Decoder) kSlice(f *codecFnInfo, rv reflect.Value) {
 				d.errorf("cannot decode into non-settable slice")
 			}
 		}
+		slh.ElemContainerState(j)
 		// if indefinite, etc, then expand the slice if necessary
 		if j >= rvlen {
 			if f.seq == seqTypeArray {
-				decArrayCannotExpand(slh, hasLen, rvlen, j, containerLenS)
+				d.arrayCannotExpand(rvlen, j+1)
+				// drain completely and return
+				d.swallow()
+				j++
+				for ; (hasLen && j < containerLenS) || !(hasLen || d.checkBreak()); j++ {
+					slh.ElemContainerState(j)
+					d.swallow()
+				}
+				slh.End()
 				return
 			}
-			slh.ElemContainerState(j)
 			// rv = reflect.Append(rv, reflect.Zero(rtelem0)) // append logic + varargs
 
 			// expand the slice up to the cap.
@@ -803,20 +807,13 @@ func (d *Decoder) kSlice(f *codecFnInfo, rv reflect.Value) {
 					d.errorf(errmsgExpandSliceCannotChange)
 					return
 				}
-				// rvcap2 := rvcap
-				rvcap = growCap(rvcap, rtelem0Size, 1)
-				// if rvcap < 32 {
-				// 	rvcap = 32
-				// }
-				// xdebugf("%v: growing cap from %v to %v (unit size: %v)", rtelem, rvcap2, rvcap, rtelem0Size)
+				rvcap = growCap(rvcap, rtelem0Size, rvcap)
 				rv9 = reflect.MakeSlice(f.ti.rt, rvcap, rvcap)
 				rvCopySlice(rv9, rv)
 				rv = rv9
 				rvChanged = true
 				rvlen = rvcap
 			}
-		} else {
-			slh.ElemContainerState(j)
 		}
 		rv9 = rvSliceIndex(rv, j, f.ti)
 		if d.h.SliceElementReset {
@@ -1092,6 +1089,44 @@ func (d *Decoder) kMap(f *codecFnInfo, rv reflect.Value) {
 	}
 
 	d.mapEnd()
+
+}
+
+// decNaked is used to keep track of the primitives decoded.
+// Without it, we would have to decode each primitive and wrap it
+// in an interface{}, causing an allocation.
+// In this model, the primitives are decoded in a "pseudo-atomic" fashion,
+// so we can rest assured that no other decoding happens while these
+// primitives are being decoded.
+//
+// maps and arrays are not handled by this mechanism.
+// However, RawExt is, and we accommodate for extensions that decode
+// RawExt from DecodeNaked, but need to decode the value subsequently.
+// kInterfaceNaked and swallow, which call DecodeNaked, handle this caveat.
+//
+// However, decNaked also keeps some arrays of default maps and slices
+// used in DecodeNaked. This way, we can get a pointer to it
+// without causing a new heap allocation.
+//
+// kInterfaceNaked will ensure that there is no allocation for the common
+// uses.
+
+type decNaked struct {
+	// r RawExt // used for RawExt, uint, []byte.
+
+	// primitives below
+	u uint64
+	i int64
+	f float64
+	l []byte
+	s string
+
+	// ---- cpu cache line boundary?
+	t time.Time
+	b bool
+
+	// state
+	v valueType
 }
 
 // Decoder reads and decodes an object from an input stream in a supported format.
@@ -1104,6 +1139,8 @@ func (d *Decoder) kMap(f *codecFnInfo, rv reflect.Value) {
 // This is the idiomatic way to use.
 type Decoder struct {
 	panicHdl
+	// hopefully, reduce derefencing cost by laying the decReader inside the Decoder.
+	// Try to put things that go together to fit within a cache line (8 words).
 
 	d decDriver
 
@@ -1119,7 +1156,7 @@ type Decoder struct {
 	decRd
 
 	// ---- cpu cache line boundary?
-	n fauxUnion
+	n decNaked
 
 	hh  Handle
 	err error
@@ -1232,16 +1269,13 @@ func (d *Decoder) ResetBytes(in []byte) {
 	if in == nil {
 		return
 	}
-	d.bufio = false
 	d.bytes = true
-	// if d.rb == nil {
-	// 	d.rb = new(bytesDecReader)
-	// }
+	d.bufio = false
 	d.rb.reset(in)
 	d.resetCommon()
 }
 
-func (d *Decoder) naked() *fauxUnion {
+func (d *Decoder) naked() *decNaked {
 	return &d.n
 }
 
@@ -1679,23 +1713,20 @@ func (d *Decoder) string(v []byte) (s string) {
 
 // nextValueBytes returns the next value in the stream as a set of bytes.
 func (d *Decoder) nextValueBytes() (bs []byte) {
-	// d.d.uncacheRead()
-	if d.js {
-		d.jsondriver().uncacheRead()
-	}
+	d.d.uncacheRead()
 	d.r().track()
 	d.swallow()
 	bs = d.r().stopTrack()
 	return
 }
 
-func (d *Decoder) rawBytes() (v []byte) {
+func (d *Decoder) rawBytes() []byte {
 	// ensure that this is not a view into the bytes
 	// i.e. make new copy always.
 	bs := d.nextValueBytes()
-	v = make([]byte, len(bs))
-	copy(v, bs)
-	return
+	bs2 := make([]byte, len(bs))
+	copy(bs2, bs)
+	return bs2
 }
 
 func (d *Decoder) wrapErr(v interface{}, err *error) {
@@ -1992,7 +2023,7 @@ func decReadFull(r io.Reader, bs []byte) (n uint, err error) {
 	return
 }
 
-func fauxUnionReadRawBytes(dr decDriver, d *Decoder, n *fauxUnion, rawToString bool) {
+func decNakedReadRawBytes(dr decDriver, d *Decoder, n *decNaked, rawToString bool) {
 	if rawToString {
 		n.v = valueTypeString
 		n.s = string(dr.DecodeBytes(d.b[:], true))
@@ -2000,17 +2031,4 @@ func fauxUnionReadRawBytes(dr decDriver, d *Decoder, n *fauxUnion, rawToString b
 		n.v = valueTypeBytes
 		n.l = dr.DecodeBytes(nil, false)
 	}
-}
-
-func decArrayCannotExpand(slh decSliceHelper, hasLen bool, lenv, j, containerLenS int) {
-	slh.d.arrayCannotExpand(lenv, j+1)
-	// drain completely and return
-	slh.ElemContainerState(j)
-	slh.d.swallow()
-	j++
-	for ; (hasLen && j < containerLenS) || !(hasLen || slh.d.checkBreak()); j++ {
-		slh.ElemContainerState(j)
-		slh.d.swallow()
-	}
-	slh.End()
 }
